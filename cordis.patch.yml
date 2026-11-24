@@ -1,0 +1,4 @@
+# 思考续接插件：失败后把未完成的 reasoning 接回模型。
+- insert:
+    - id: thinking-resume
+      name: 'dsh-thinking-resume'

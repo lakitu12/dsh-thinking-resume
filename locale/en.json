@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Stream resume",
+    "description": "Preserves reasoning, visible text, and tool-call drafts already streamed before an interrupted model request, so the retry continues from that point instead of starting over."
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "name": "dsh-thinking-resume",
+  "version": "0.2.0",
+  "description": "中断续接：把 API 中断前已产生的思考、正文和工具调用草稿接回模型，避免从头重做。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/run.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "cordis-plugin",
+    "stream-resume",
+    "interrupted",
+    "retry",
+    "reasoning"
+  ],
+  "license": "MIT",
+  "author": "lakitu12",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lakitu12/dsh-thinking-resume.git"
+  },
+  "homepage": "https://github.com/lakitu12/dsh-thinking-resume#readme",
+  "bugs": {
+    "url": "https://github.com/lakitu12/dsh-thinking-resume/issues"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.2-0"
+  },
+  "dsh": {
+    "runtime": "host",
+    "engines": {
+      "dsh": ">=0.2.2-0"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
