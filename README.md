@@ -12,7 +12,7 @@
 dsh plugin --profile <profile名> add github:lakitu12/dsh-thinking-resume
 ```
 
-然后把 `dsh-thinking-resume` 加进该 profile `package.json` 的 `dsh.profile.bundles` 数组，重启 DSH。
+`dsh plugin` 识别到包里的 bundle patch 后会自动把它写进该 profile 的 `dsh.profile.bundles`；重启 DSH 生效。
 
 本地开发直接 link 工作目录：
 
