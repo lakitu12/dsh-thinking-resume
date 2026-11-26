@@ -84,8 +84,13 @@ async function testFailureInjection() {
   assert.equal(resume.surfaceOp, 'append')
   assert.equal(resume.data.source.kind, 'thinking-resume')
   assert.ok(resume.data.content[0].text.includes('A'.repeat(300)), 'reasoning preserved verbatim')
-  assert.ok(resume.data.content[0].text.includes('流式续接'), 'resume header present')
-  assert.ok(resume.data.source.summary.includes('300'), 'summary reports character count')
+  assert.ok(resume.data.content[0].text.includes('【中断续接】'), 'resume header present')
+  assert.ok(resume.data.content[0].text.includes('TRANSPORT'), 'failure code stated')
+  assert.ok(resume.data.content[0].text.includes('── 中断前的思考 ──'), 'reasoning section titled for a reader')
+  assert.ok(resume.data.content[0].text.includes('对用户是这次中断留下的现场'), 'framing addresses the user too')
+  assert.ok(resume.data.source.summary.startsWith('输出中断（TRANSPORT）：思考 300 字'), 'summary names the saved output')
+  assert.ok(resume.data.source.summary.endsWith('」'), 'summary previews where generation stopped')
+  assert.ok(resume.data.source.summary.length <= 120, 'summary stays inside the one-line bound')
 }
 
 async function testMinChars() {
@@ -130,9 +135,10 @@ async function testTextOnly() {
   const resume = session.log.find((event) => event.type === 'user/message')
   assert.ok(resume, 'text-only attempt is resumed')
   const body = resume.data.content[0].text
-  assert.ok(body.includes('=== 已输出的正文（text）==='), 'text section present')
+  assert.ok(body.includes('── 中断前已输出的正文 ──'), 'text section present')
   assert.ok(body.includes('已经写出了一半的答复。'), 'text preserved')
-  assert.ok(!body.includes('内部思考'), 'no empty reasoning section')
+  assert.ok(!body.includes('中断前的思考 ──'), 'no empty reasoning section')
+  assert.ok(session.log.find((event) => event.type === 'user/message').data.source.summary.startsWith('输出中断（TRANSPORT）：正文 330 字'), 'summary counts only the text section')
 }
 
 async function testToolDraft() {
@@ -145,10 +151,10 @@ async function testToolDraft() {
   })
   await fire(listeners, 'agent/request-error', failurePayload(session))
   const body = session.log.find((event) => event.type === 'user/message').data.content[0].text
-  assert.ok(body.includes('=== 已发起但尚未执行的工具调用 ==='), 'tool section present')
+  assert.ok(body.includes('── 已发起但未执行的工具调用 ──'), 'tool section present')
   assert.ok(body.includes('read_file'), 'tool name preserved')
   assert.ok(body.includes('{"path":"src/index.js"}'), 'tool arguments preserved')
-  assert.ok(body.indexOf('内部思考') < body.indexOf('工具调用'), 'sections follow stream order')
+  assert.ok(body.indexOf('中断前的思考') < body.indexOf('工具调用'), 'sections follow stream order')
 }
 
 async function testTailClampKeepsTextAndTools() {
@@ -167,6 +173,25 @@ async function testTailClampKeepsTextAndTools() {
   assert.ok(!body.includes('OLD'), 'oldest reasoning trimmed first')
   assert.ok(body.includes('NEW'), 'newest reasoning retained')
   assert.ok(body.includes('本节过长，只保留中断前最后'), 'trim notice present')
+}
+
+async function testLargeCountsAndBoundedSummary() {
+  const session = makeSession()
+  const { ctx, listeners } = makeCtx()
+  apply(ctx, {})
+  pushAttempt(session, 1, 1, {
+    reasoning: '想'.repeat(3200),
+    text: '这是一段很长的正文，'.repeat(40),
+    tools: [
+      { id: 'call_1', name: 'bash', args: '{"command":"ls"}' },
+      { id: 'call_2', name: 'read', args: '{"path":"a"}' },
+    ],
+  })
+  await fire(listeners, 'agent/request-error', failurePayload(session))
+  const summary = session.log.find((event) => event.type === 'user/message').data.source.summary
+  assert.ok(summary.includes('思考 3.2k 字'), 'large reasoning counts compact to k')
+  assert.ok(summary.includes('工具草稿 2 个'), 'tool draft count reported')
+  assert.ok(summary.length <= 120, 'summary never exceeds the one-line bound')
 }
 
 async function testAbortedSignalSkipped() {
@@ -189,6 +214,8 @@ async function testPreStepOrphanRecovery() {
   assert.ok(resume, 'resume queued for new turn')
   assert.ok(resume.content[0].text.includes('F'.repeat(300)))
   assert.ok(resume.content[0].text.includes('草稿正文'))
+  assert.ok(resume.source.summary.startsWith('输出中断：'), 'recovery without a failure omits the error code')
+  assert.ok(resume.source.summary.includes('思考 300 字'), 'recovery summary still reports the sections')
 }
 
 async function testPreStepSkipsSettled() {
@@ -221,6 +248,7 @@ await testRepeatedFailuresAccumulate()
 await testTextOnly()
 await testToolDraft()
 await testTailClampKeepsTextAndTools()
+await testLargeCountsAndBoundedSummary()
 await testAbortedSignalSkipped()
 await testPreStepOrphanRecovery()
 await testPreStepSkipsSettled()

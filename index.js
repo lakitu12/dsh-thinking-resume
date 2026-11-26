@@ -119,7 +119,13 @@ function clampBody(text, maxChars) {
 }
 
 /**
- * Render the model-facing resume instruction around the preserved output.
+ * Render the resume message around the preserved output.
+ *
+ * The same text is read twice: the model continues from it, and the user reads
+ * it in the context card as the record of what the interrupted request had
+ * already produced. So the framing states the situation plainly, the section
+ * titles name what the reader is looking at, and only the closing line speaks
+ * to the model alone.
  * Budget is allocated newest-first (tool drafts, then text, then reasoning),
  * because the interruption point always sits at the end of the stream.
  * @param options - parsed parts, budget, failure facts, and attempt number.
@@ -127,13 +133,13 @@ function clampBody(text, maxChars) {
  */
 function buildResumeText({ parts, maxChars, failure, count }) {
   const toolLines = parts.tools.map((tool, index) => {
-    const name = tool.name ? ` ${tool.name}` : ` tool#${index + 1}`
+    const name = tool.name ? ` ${tool.name}` : ` 工具 #${index + 1}`
     return `-${name}${tool.id ? ` (${tool.id})` : ''}: ${tool.text || '{}'}`
   })
   const sections = []
-  if (parts.reasoning) sections.push({ key: 'reasoning', title: '=== 内部思考（reasoning）===', body: parts.reasoning })
-  if (parts.text) sections.push({ key: 'text', title: '=== 已输出的正文（text）===', body: parts.text })
-  if (toolLines.length > 0) sections.push({ key: 'tools', title: '=== 已发起但尚未执行的工具调用 ===', body: toolLines.join('\n') })
+  if (parts.reasoning) sections.push({ key: 'reasoning', title: '── 中断前的思考 ──', body: parts.reasoning })
+  if (parts.text) sections.push({ key: 'text', title: '── 中断前已输出的正文 ──', body: parts.text })
+  if (toolLines.length > 0) sections.push({ key: 'tools', title: '── 已发起但未执行的工具调用 ──', body: toolLines.join('\n') })
 
   let budget = Number.isFinite(maxChars) && maxChars > 0 ? Math.floor(maxChars) : Infinity
   const fitted = new Map()
@@ -153,10 +159,11 @@ function buildResumeText({ parts, maxChars, failure, count }) {
     }
   }
 
+  const reason = `${failure?.code ?? 'ERROR'}${failure?.message ? `：${failure.message}` : ''}`
   const lines = [
-    '【流式续接 / stream resume】',
-    `上一次模型请求在你的输出进行到中途时中断（${failure?.code ?? 'ERROR'}${failure?.message ? `：${failure.message}` : ''}）。`,
-    '下面是你中断前已经产生的流式输出原文，由 DSH 插件自动保存并在此接续；它不是用户的新指令，也不是要复述的内容。',
+    '【中断续接】',
+    `上一次请求在输出到中途时失败了（${reason}）。`,
+    '下面这段是失败前已经产生、但没有提交到会话里的输出原文，由 DSH 插件在失败瞬间保存：对用户是这次中断留下的现场，对模型是接着往下写的断点，不是新的指令。',
   ]
   if (count > 1) lines.splice(1, 0, `（这是本次请求的第 ${count} 次中断续接）`)
   for (const section of sections) {
@@ -167,7 +174,7 @@ function buildResumeText({ parts, maxChars, failure, count }) {
     lines.push(kept.body)
   }
   lines.push('')
-  lines.push('请从最后一个字符处紧接着继续生成：不要重复已经输出的内容，不要从头开始。若已经可以得出结论，直接继续正文或发起工具调用。')
+  lines.push('（模型：请从最后一个字符处紧接着继续生成，不要重复已输出的内容，也不要从头开始；若已能得出结论，直接继续正文或发起工具调用。）')
   return lines.join('\n')
 }
 
@@ -241,12 +248,48 @@ function alreadyResumed(session, attemptSeq) {
   return false
 }
 
+/** Compact character count for the collapsed row: 812, 3.2k, 41k. */
+function compactCount(chars) {
+  if (chars < 1000) return String(chars)
+  const thousands = chars / 1000
+  return `${thousands >= 10 ? Math.round(thousands) : thousands.toFixed(1)}k`
+}
+
+/** The streamed text as one flat line, tail-first, so a preview shows the break point. */
+function tailPreview(text, maxChars) {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  if (flat === '') return ''
+  return flat.length > maxChars ? `…${flat.slice(flat.length - maxChars)}` : flat
+}
+
+/**
+ * Compose the one-line account shown on the collapsed context row.
+ *
+ * That row is the only part of a collapsed card a reader sees, and its source
+ * never reaches the model, so it exists purely for the human: it names the
+ * failure, how much of each section was saved, and where generation stopped.
+ * @param parts - parsed streamed output.
+ * @param failure - the failure that ended the request, absent on later recovery.
+ * @returns a bounded single-line summary.
+ */
+function summarizeParts(parts, failure) {
+  const bits = []
+  if (parts.reasoning) bits.push(`思考 ${compactCount(parts.reasoning.length)} 字`)
+  if (parts.text) bits.push(`正文 ${compactCount(parts.text.length)} 字`)
+  if (parts.tools.length > 0) bits.push(`工具草稿 ${parts.tools.length} 个`)
+  const reason = typeof failure?.code === 'string' && failure.code !== '' ? `（${failure.code}）` : ''
+  const stopped = tailPreview(parts.text || parts.reasoning, 48)
+  const head = `输出中断${reason}：${bits.join(' · ')}`
+  const summary = stopped === '' ? head : `${head}，断在「${stopped}」`
+  return summary.length > 120 ? `${summary.slice(0, 119)}…` : summary
+}
+
 /**
  * Build one frozen surface user message carrying preserved output.
  * @param options - rendered text and the attempt facts it derives from.
  * @returns a durable user message ready for `Session.append`.
  */
-function makeResumeMessage({ text, attemptSeq, turn, step, chars }) {
+function makeResumeMessage({ text, summary, attemptSeq, turn, step, chars }) {
   return Object.freeze({
     id: randomUUID(),
     role: 'user',
@@ -254,10 +297,11 @@ function makeResumeMessage({ text, attemptSeq, turn, step, chars }) {
     source: Object.freeze({
       kind: SOURCE_KIND,
       form: 'notice',
-      summary: `输出中断，已接续 ${chars} 字符`,
+      summary,
       attemptSeq,
       turn,
       step,
+      chars,
     }),
   })
 }
@@ -309,7 +353,8 @@ export function apply(ctx, config) {
     if (!deliver && alreadyResumed(session, attempt.seq)) return undefined
     const count = nextCount(session, turn, step)
     const text = buildResumeText({ parts, maxChars: maxInjectChars, failure, count })
-    const message = makeResumeMessage({ text, attemptSeq: attempt.seq, turn, step, chars: total })
+    const summary = summarizeParts(parts, failure)
+    const message = makeResumeMessage({ text, summary, attemptSeq: attempt.seq, turn, step, chars: total })
     if (deliver) {
       session.append('user/message', message, { surfaceOp: 'append' })
       verbose && ctx.logger?.info?.(`${TAG}: resumed turn=${turn} step=${step} chars=${total} code=${failure?.code ?? '?'}`)
