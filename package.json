@@ -1,6 +1,6 @@
 {
   "name": "dsh-thinking-resume",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "中断续接：把 API 中断前已产生的思考、正文和工具调用草稿接回模型，避免从头重做。",
   "type": "module",
   "main": "index.js",
