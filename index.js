@@ -34,6 +34,8 @@ const DEFAULT_EXCLUDE_CODES = [
 const DEFAULT_CONFIG = {
   enabled: true,
   minChars: 200,
+  keepMinChars: 0,
+  keepOnExcluded: true,
   maxInjectChars: 0,
   recoverOnResume: true,
   excludeCodes: DEFAULT_EXCLUDE_CODES,
@@ -131,7 +133,7 @@ function clampBody(text, maxChars) {
  * @param options - parsed parts, budget, failure facts, and attempt number.
  * @returns the text of the injected user message.
  */
-function buildResumeText({ parts, maxChars, failure, count }) {
+function buildResumeText({ parts, maxChars, failure, count, keepOnly }) {
   const toolLines = parts.tools.map((tool, index) => {
     const name = tool.name ? ` ${tool.name}` : ` 工具 #${index + 1}`
     return `-${name}${tool.id ? ` (${tool.id})` : ''}: ${tool.text || '{}'}`
@@ -160,12 +162,18 @@ function buildResumeText({ parts, maxChars, failure, count }) {
   }
 
   const reason = `${failure?.code ?? 'ERROR'}${failure?.message ? `：${failure.message}` : ''}`
-  const lines = [
-    '【中断续接】',
-    `上一次请求在输出到中途时失败了（${reason}）。`,
-    '下面这段是失败前已经产生、但没有提交到会话里的输出原文，由 DSH 插件在失败瞬间保存：对用户是这次中断留下的现场，对模型是接着往下写的断点，不是新的指令。',
-  ]
-  if (count > 1) lines.splice(1, 0, `（这是本次请求的第 ${count} 次中断续接）`)
+  const lines = keepOnly
+    ? [
+      '【中断留存】',
+      `上一次请求在输出到中途时失败了（${reason}），这次失败不会被自动续接。`,
+      '下面这段是失败前已经产生、但没有提交到会话里的输出原文，由 DSH 插件在失败瞬间保存下来，供回看：它不是用户的新指令，也不是要接着写的内容。',
+    ]
+    : [
+      '【中断续接】',
+      `上一次请求在输出到中途时失败了（${reason}）。`,
+      '下面这段是失败前已经产生、但没有提交到会话里的输出原文，由 DSH 插件在失败瞬间保存：对用户是这次中断留下的现场，对模型是接着往下写的断点，不是新的指令。',
+    ]
+  if (count > 1) lines.splice(1, 0, `（这是本次请求的第 ${count} 次中断${keepOnly ? '留存' : '续接'}）`)
   for (const section of sections) {
     const kept = fitted.get(section.key)
     lines.push('')
@@ -174,7 +182,9 @@ function buildResumeText({ parts, maxChars, failure, count }) {
     lines.push(kept.body)
   }
   lines.push('')
-  lines.push('（模型：请从最后一个字符处紧接着继续生成，不要重复已输出的内容，也不要从头开始；若已能得出结论，直接继续正文或发起工具调用。）')
+  lines.push(keepOnly
+    ? '（模型：以上是上一次请求失败前的残稿，只作背景参考，不要接着往下写；请按用户最新的消息正常回应。）'
+    : '（模型：请从最后一个字符处紧接着继续生成，不要重复已输出的内容，也不要从头开始；若已能得出结论，直接继续正文或发起工具调用。）')
   return lines.join('\n')
 }
 
@@ -272,14 +282,14 @@ function tailPreview(text, maxChars) {
  * @param failure - the failure that ended the request, absent on later recovery.
  * @returns a bounded single-line summary.
  */
-function summarizeParts(parts, failure) {
+function summarizeParts(parts, failure, keepOnly) {
   const bits = []
   if (parts.reasoning) bits.push(`思考 ${compactCount(parts.reasoning.length)} 字`)
   if (parts.text) bits.push(`正文 ${compactCount(parts.text.length)} 字`)
   if (parts.tools.length > 0) bits.push(`工具草稿 ${parts.tools.length} 个`)
   const reason = typeof failure?.code === 'string' && failure.code !== '' ? `（${failure.code}）` : ''
   const stopped = tailPreview(parts.text || parts.reasoning, 48)
-  const head = `输出中断${reason}：${bits.join(' · ')}`
+  const head = `${keepOnly ? '已留存' : '输出中断'}${reason}：${bits.join(' · ')}`
   const summary = stopped === '' ? head : `${head}，断在「${stopped}」`
   return summary.length > 120 ? `${summary.slice(0, 119)}…` : summary
 }
@@ -319,6 +329,12 @@ export function apply(ctx, config) {
     return
   }
   const minChars = Number.isFinite(cfg.minChars) ? Math.max(0, cfg.minChars) : 200
+  // Saving for the reader is cheaper than resuming for the model, so its floor is separate.
+  const keepMinChars = Math.min(
+    minChars,
+    Number.isFinite(cfg.keepMinChars) ? Math.max(0, cfg.keepMinChars) : 0,
+  )
+  const keepOnExcluded = cfg.keepOnExcluded !== false
   const maxInjectChars = Number.isFinite(cfg.maxInjectChars) ? Math.max(0, cfg.maxInjectChars) : 0
   const recoverOnResume = cfg.recoverOnResume !== false
   const exclude = new Set(Array.isArray(cfg.excludeCodes) ? cfg.excludeCodes : DEFAULT_EXCLUDE_CODES)
@@ -339,12 +355,21 @@ export function apply(ctx, config) {
 
   /**
    * Append (or hand back) one resume message for a failed attempt.
+   *
+   * Two outcomes share the message: a resume the model continues from, and a
+   * keep-alive record of output that would otherwise vanish. The `keepOnly`
+   * variant is chosen when the model must not continue (an excluded failure)
+   * or when the output is too short to be worth resuming — the reader still
+   * gets the text either way.
    * @returns the message when it should enter a new turn, otherwise undefined.
    */
-  function prepareResume({ session, turn, step, attempt, failure, deliver }) {
+  function prepareResume({ session, turn, step, attempt, failure, deliver, excluded = false }) {
     const parts = streamParts(attempt)
     const total = partsLength(parts)
-    if (total < minChars) return undefined
+    if (total <= 0) return undefined
+    const keepOnly = excluded || total < minChars
+    if (excluded && !keepOnExcluded) return undefined
+    if (total < (keepOnly ? keepMinChars : minChars)) return undefined
     const settlement = `${String(session.id)}:${attempt.seq}`
     if (injected.has(settlement)) return undefined
     injected.add(settlement)
@@ -352,15 +377,15 @@ export function apply(ctx, config) {
     // A queued resume is not in the surface yet; keep it from being produced twice.
     if (!deliver && alreadyResumed(session, attempt.seq)) return undefined
     const count = nextCount(session, turn, step)
-    const text = buildResumeText({ parts, maxChars: maxInjectChars, failure, count })
-    const summary = summarizeParts(parts, failure)
+    const text = buildResumeText({ parts, maxChars: maxInjectChars, failure, count, keepOnly })
+    const summary = summarizeParts(parts, failure, keepOnly)
     const message = makeResumeMessage({ text, summary, attemptSeq: attempt.seq, turn, step, chars: total })
     if (deliver) {
       session.append('user/message', message, { surfaceOp: 'append' })
-      verbose && ctx.logger?.info?.(`${TAG}: resumed turn=${turn} step=${step} chars=${total} code=${failure?.code ?? '?'}`)
+      verbose && ctx.logger?.info?.(`${TAG}: ${keepOnly ? 'kept' : 'resumed'} turn=${turn} step=${step} chars=${total} code=${failure?.code ?? '?'}`)
       return undefined
     }
-    verbose && ctx.logger?.info?.(`${TAG}: queued resume for next turn=${turn} step=${step} chars=${total}`)
+    verbose && ctx.logger?.info?.(`${TAG}: queued ${keepOnly ? 'keep' : 'resume'} for next turn=${turn} step=${step} chars=${total}`)
     return message
   }
 
@@ -370,11 +395,13 @@ export function apply(ctx, config) {
     try {
       const { agent, turn, step, failure, signal } = payload ?? {}
       const session = agent?.session
+      // An aborted request is settled by the loop itself: it appends the frozen
+      // streaming prefix as a real assistant message, so nothing is lost there.
       if (session && signal?.aborted !== true) {
         const code = typeof failure?.code === 'string' ? failure.code : ''
-        if (!exclude.has(code)) {
-          const attempt = findFailedAttempt(session, turn, step)
-          if (attempt !== undefined) prepareResume({ session, turn, step, attempt, failure, deliver: true })
+        const attempt = findFailedAttempt(session, turn, step)
+        if (attempt !== undefined) {
+          prepareResume({ session, turn, step, attempt, failure, deliver: true, excluded: exclude.has(code) })
         }
       }
     } catch (error) {

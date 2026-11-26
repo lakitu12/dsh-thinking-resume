@@ -93,22 +93,59 @@ async function testFailureInjection() {
   assert.ok(resume.data.source.summary.length <= 120, 'summary stays inside the one-line bound')
 }
 
-async function testMinChars() {
+async function testShortOutputKeptForReading() {
   const session = makeSession()
   const { ctx, listeners } = makeCtx()
   apply(ctx, { minChars: 500 })
-  pushAttempt(session, 1, 1, { reasoning: 'short reasoning' })
+  pushAttempt(session, 1, 1, { reasoning: '短思考，但也是失败前已经产生的输出。' })
   await fire(listeners, 'agent/request-error', failurePayload(session))
-  assert.equal(session.log.filter((event) => event.type === 'user/message').length, 0)
+  const resume = session.log.find((event) => event.type === 'user/message')
+  assert.ok(resume, 'short output is still saved for the reader')
+  const body = resume.data.content[0].text
+  assert.ok(body.includes('【中断留存】'), 'kept output is marked as not resumed')
+  assert.ok(body.includes('短思考，但也是失败前已经产生的输出。'), 'short content preserved')
+  assert.ok(body.includes('不要接着往下写'), 'keep variant forbids continuing')
+  assert.ok(resume.data.source.summary.startsWith('已留存（TRANSPORT）'), 'summary marks a keep record')
 }
 
-async function testExcludeCodes() {
+async function testEmptyAttemptWritesNothing() {
+  const session = makeSession()
+  const { ctx, listeners } = makeCtx()
+  apply(ctx, {})
+  pushAttempt(session, 1, 1, {})
+  await fire(listeners, 'agent/request-error', failurePayload(session))
+  assert.equal(session.log.filter((event) => event.type === 'user/message').length, 0, 'no output, no card')
+}
+
+async function testKeepFloorSkipsEmptyNoise() {
+  const session = makeSession()
+  const { ctx, listeners } = makeCtx()
+  apply(ctx, { minChars: 500, keepMinChars: 100 })
+  pushAttempt(session, 1, 1, { reasoning: '只有几十个字' })
+  await fire(listeners, 'agent/request-error', failurePayload(session))
+  assert.equal(session.log.filter((event) => event.type === 'user/message').length, 0, 'below the keep floor nothing is written')
+}
+
+async function testExcludedCodeIsKeptNotResumed() {
   const session = makeSession()
   const { ctx, listeners } = makeCtx()
   apply(ctx, {})
   pushAttempt(session, 1, 1, { reasoning: 'B'.repeat(300) })
+  await fire(listeners, 'agent/request-error', failurePayload(session, { code: 'CONTEXT_WINDOW_EXCEEDED' }))
+  const resume = session.log.find((event) => event.type === 'user/message')
+  assert.ok(resume, 'an excluded failure is still saved for the reader')
+  assert.ok(resume.data.content[0].text.includes('【中断留存】'), 'kept, not resumed')
+  assert.ok(resume.data.content[0].text.includes('B'.repeat(300)), 'the thinking survives')
+  assert.ok(!resume.data.content[0].text.includes('请从最后一个字符处紧接着继续生成'), 'no resume instruction')
+}
+
+async function testExcludedCodeCanSkipSaving() {
+  const session = makeSession()
+  const { ctx, listeners } = makeCtx()
+  apply(ctx, { keepOnExcluded: false })
+  pushAttempt(session, 1, 1, { reasoning: 'B'.repeat(300) })
   await fire(listeners, 'agent/request-error', failurePayload(session, { code: 'AUTH' }))
-  assert.equal(session.log.filter((event) => event.type === 'user/message').length, 0)
+  assert.equal(session.log.filter((event) => event.type === 'user/message').length, 0, 'opt-out keeps the old behaviour')
 }
 
 async function testRepeatedFailuresAccumulate() {
@@ -242,8 +279,11 @@ async function testPreStepAfterResume() {
 }
 
 await testFailureInjection()
-await testMinChars()
-await testExcludeCodes()
+await testShortOutputKeptForReading()
+await testKeepFloorSkipsEmptyNoise()
+await testEmptyAttemptWritesNothing()
+await testExcludedCodeIsKeptNotResumed()
+await testExcludedCodeCanSkipSaving()
 await testRepeatedFailuresAccumulate()
 await testTextOnly()
 await testToolDraft()
